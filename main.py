@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="PriceDekho AI",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -23,7 +23,7 @@ app.add_middleware(
 )
 
 API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 MAX_SIZE = 8 * 1024 * 1024
 
@@ -91,7 +91,7 @@ def identify_product(image_bytes, mime_type):
             endpoint,
             headers={"x-goog-api-key": API_KEY},
             json=payload,
-            timeout=60
+            timeout=90
         )
 
         response.raise_for_status()
@@ -133,22 +133,36 @@ def identify_product(image_bytes, mime_type):
             ).strip()
         }
 
-    except requests.exceptions.RequestException:
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code
+        error_text = e.response.text[:2000]
+
+        print("GEMINI HTTP STATUS:", status)
+        print("GEMINI ERROR RESPONSE:", error_text)
+
         raise HTTPException(
             status_code=502,
-            detail="Could not connect to Gemini."
+            detail={
+                "message": "Gemini API rejected the request.",
+                "gemini_status": status,
+                "gemini_error": error_text
+            }
         )
 
-    except (
-        KeyError,
-        IndexError,
-        ValueError,
-        TypeError,
-        json.JSONDecodeError
-    ):
+    except requests.exceptions.RequestException as e:
+        print("GEMINI CONNECTION ERROR:", str(e))
+
         raise HTTPException(
             status_code=502,
-            detail="Invalid AI response."
+            detail="Could not connect to Gemini. Check Render logs."
+        )
+
+    except (KeyError, IndexError, ValueError, TypeError) as e:
+        print("GEMINI RESPONSE ERROR:", str(e))
+
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned an invalid response."
         )
 
 
@@ -163,7 +177,7 @@ def home():
     return {
         "app": "PriceDekho AI",
         "status": "running",
-        "version": "1.0.0"
+        "version": "1.1.0"
     }
 
 
@@ -172,6 +186,7 @@ def health():
     return {
         "status": "ok",
         "ai_configured": bool(API_KEY),
+        "model": MODEL,
         "service": "PriceDekho AI Backend"
     }
 
@@ -248,5 +263,5 @@ async def search_image(
         ),
         "product": product,
         "offers": offers
-      }
-  
+    }
+    
