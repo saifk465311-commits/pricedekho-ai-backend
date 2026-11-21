@@ -1,172 +1,127 @@
+
 import os
 import io
 import json
-import base64
 import re
-import requests
-
+import logging
 from urllib.parse import quote_plus
+from typing import Optional, List, Dict, Any
 
-from PIL import Image, UnidentifiedImageError
-
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    HTTPException
-)
-
+import requests
+from PIL import Image
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pricedekho")
 
-# ==========================================
-# PRICEDEKHO AI - VERSION 3.0
-# ==========================================
+APP_NAME = "PriceDekho AI"
+APP_VERSION = "4.0.0"
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
 app = FastAPI(
-    title="PriceDekho AI",
-    description="AI Product Identification and Marketplace Redirect API",
-    version="3.0.0"
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="AI Product Identification and Marketplace Link Matching API"
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-
-API_KEY = os.getenv("GEMINI_API_KEY")
-
-MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash"
-)
-
-MAX_SIZE = 8 * 1024 * 1024
-
-MIN_CONFIDENCE = 0.75
-
-ALLOWED_TYPES = {
-    "image/jpeg",
-    "image/png",
-    "image/webp"
-}
+class Product(BaseModel):
+    brand: str = ""
+    model: str = ""
+    category: str = ""
+    variant: str = ""
+    confidence: float = 0.0
+    evidence: str = ""
 
 
-# ==========================================
-# MARKETPLACE INFORMATION
-# ==========================================
-
-MARKETPLACES = {
-    "amazon": "Amazon",
-    "flipkart": "Flipkart",
-    "meesho": "Meesho",
-    "google_shopping": "Google Shopping",
-    "myntra": "Myntra",
-    "ajio": "AJIO",
-    "tata_cliq": "Tata CLiQ"
-}
-# ==========================================
-# TEXT HELPERS
-# ==========================================
-
-def clean_text(value, default="unknown"):
-
-    if value is None:
-        return default
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        str(value)
-    ).strip()
-
-    return value if value else default
+class ProductLinkRequest(BaseModel):
+    brand: str
+    model: str
+    variant: str = ""
 
 
-def normalize_text(value):
+class Marketplace(BaseModel):
+    name: str
+    url: str
+    link_type: str = "search"
+    exact_match: bool = False
+    
+def identify_product(image_bytes: bytes, mime_type: str) -> Product:
 
-    value = clean_text(value, "")
-
-    return re.sub(
-        r"[^a-z0-9]+",
-        "",
-        value.lower()
-    )
-
-
-# ==========================================
-# GEMINI PRODUCT IDENTIFICATION
-# ==========================================
-
-def identify_product(image_bytes, mime_type):
-
-    if not API_KEY:
+    if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
             detail="Gemini API key is not configured."
         )
 
     prompt = """
-    Identify the consumer product in this image.
+You are an accurate product identification AI.
 
-    Return ONLY valid JSON:
+Analyze the uploaded product image.
 
-    {
-      "brand": "brand name or unknown",
-      "model": "exact model or unknown",
-      "category": "product category",
-      "variant": "color, size or variant, otherwise unknown",
-      "confidence": 0.0,
-      "evidence": "visible identifying clues"
-    }
+Identify:
+1. Brand name
+2. Exact model name
+3. Product category
+4. Variant, color, size or capacity if visible
+5. Confidence from 0 to 1
+6. Visual evidence
 
-    Rules:
+Rules:
+- Do not guess model names.
+- Do not invent specifications.
+- If model is unclear, return empty model.
+- Only use visible evidence.
+- Return valid JSON only.
 
-    1. Identify the exact brand and model only
-       when supported by visible evidence.
+JSON format:
+{
+  "brand": "",
+  "model": "",
+  "category": "",
+  "variant": "",
+  "confidence": 0.0,
+  "evidence": ""
+}
+"""
 
-    2. Never guess an exact model.
-
-    3. Do not confuse similar-looking products.
-
-    4. If exact model is not identifiable,
-       return unknown.
-
-    5. Do not invent product specifications.
-
-    6. Confidence must be between 0 and 1.
-
-    7. Return valid JSON only.
-    """
-
-    endpoint = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{MODEL}:generateContent"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        + GEMINI_MODEL
+        + ":generateContent?key="
+        + GEMINI_API_KEY
     )
 
     payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "text": prompt
-                },
-                {
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": base64.b64encode(
-                            image_bytes
-                        ).decode("utf-8")
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": __import__("base64").b64encode(
+                                image_bytes
+                            ).decode("utf-8")
+                        }
                     }
-                }
-            ]
-        }],
+                ]
+            }
+        ],
         "generationConfig": {
             "temperature": 0.1,
             "responseMimeType": "application/json"
@@ -174,501 +129,411 @@ def identify_product(image_bytes, mime_type):
     }
 
     try:
-
         response = requests.post(
-            endpoint,
-            headers={
-                "x-goog-api-key": API_KEY
-            },
+            url,
             json=payload,
             timeout=60
         )
 
         response.raise_for_status()
+        result = response.json()
 
-        data = response.json()
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
+        data = json.loads(text)
 
-        candidates = data.get(
-            "candidates",
-            []
+        confidence = float(data.get("confidence", 0))
+
+        return Product(
+            brand=str(data.get("brand", "")).strip(),
+            model=str(data.get("model", "")).strip(),
+            category=str(data.get("category", "")).strip(),
+            variant=str(data.get("variant", "")).strip(),
+            confidence=max(0.0, min(1.0, confidence)),
+            evidence=str(data.get("evidence", "")).strip()
         )
 
-        if not candidates:
-            raise ValueError(
-                "Gemini returned no candidates."
-            )
+    except HTTPException:
+        raise
 
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-
-        if not parts or "text" not in parts[0]:
-            raise ValueError(
-                "Gemini returned no text."
-            )
-
-        result_text = parts[0]["text"].strip()
-
-        result_text = re.sub(
-            r"^```(?:json)?\s*|\s*```$",
-            "",
-            result_text
-        )
-
-        product = json.loads(result_text)
-
-        confidence = float(
-            product.get("confidence", 0)
-        )
-
-        if not 0 <= confidence <= 1:
-            confidence = 0
-
-        return {
-            "brand": clean_text(
-                product.get("brand")
-            ),
-            "model": clean_text(
-                product.get("model")
-            ),
-            "category": clean_text(
-                product.get("category")
-            ),
-            "variant": clean_text(
-                product.get("variant")
-            ),
-            "confidence": confidence,
-            "evidence": clean_text(
-                product.get("evidence"),
-                ""
-            )
-        }
-
-    except requests.exceptions.RequestException:
+    except Exception as error:
+        logger.exception("Gemini identification failed")
 
         raise HTTPException(
             status_code=502,
-            detail="Could not connect to Gemini."
-        )
-
-    except (
-        KeyError,
-        IndexError,
-        ValueError,
-        TypeError,
-        json.JSONDecodeError
-    ):
-
-        raise HTTPException(
-            status_code=502,
-            detail="Invalid AI response."
+            detail="Product identification failed: " + str(error)
         )
 
 
-# ==========================================
-# EXACT PRODUCT VERIFICATION
-# ==========================================
+def is_exact_product(product: Product) -> bool:
 
-def is_exact_product(product):
-
-    brand = normalize_text(
-        product.get("brand")
+    return (
+        bool(product.brand.strip())
+        and bool(product.model.strip())
+        and product.confidence >= 0.75
     )
 
-    model = normalize_text(
-        product.get("model")
-    )
 
-    confidence = product.get(
-        "confidence",
-        0
-    )
+def make_product_query(product: Product) -> str:
 
-    if not brand or not model:
-        return False
+    parts = [
+        product.brand,
+        product.model,
+        product.variant
+    ]
 
-    if brand == "unknown" or model == "unknown":
-        return False
+    return " ".join(
+        str(part).strip()
+        for part in parts
+        if str(part).strip()
+)
+MARKETPLACE_CONFIG = [
+    {
+        "name": "Amazon",
+        "search": "https://www.amazon.in/s?k={query}",
+        "direct": "https://www.amazon.in/dp/{product_id}"
+    },
+    {
+        "name": "Flipkart",
+        "search": "https://www.flipkart.com/search?q={query}",
+        "direct": None
+    },
+    {
+        "name": "Meesho",
+        "search": "https://www.meesho.com/search?q={query}",
+        "direct": None
+    },
+    {
+        "name": "Google Shopping",
+        "search": "https://www.google.com/search?tbm=shop&q={query}",
+        "direct": None
+    },
+    {
+        "name": "Myntra",
+        "search": "https://www.myntra.com/search?query={query}",
+        "direct": None
+    },
+    {
+        "name": "AJIO",
+        "search": "https://www.ajio.com/search/?text={query}",
+        "direct": None
+    },
+    {
+        "name": "Tata CLiQ",
+        "search": "https://www.tatacliq.com/search/?searchCategory=all&text={query}",
+        "direct": None
+    }
+]
 
-    if confidence < MIN_CONFIDENCE:
-        return False
 
-    return True
-    
-# ==========================================
-# MARKETPLACE DIRECT SEARCH LINKS
-# ==========================================
+def validate_direct_url(name: str, url: str) -> bool:
 
-def create_marketplace_links(product):
-
-    brand = clean_text(
-        product.get("brand"),
-        ""
-    )
-
-    model = clean_text(
-        product.get("model"),
-        ""
-    )
-
-    variant = clean_text(
-        product.get("variant"),
-        ""
-    )
-
-    # Build product query.
-
-    query = f"{brand} {model}"
-
-    if variant and variant.lower() != "unknown":
-        query += f" {variant}"
-
-    query = re.sub(
-        r"\s+",
-        " ",
-        query
-    ).strip()
-
-    q = quote_plus(query)
-
-    return {
-        "amazon": {
-            "name": "Amazon",
-            "url": f"https://www.amazon.in/s?k={q}",
-            "link_type": "search"
-        },
-
-        "flipkart": {
-            "name": "Flipkart",
-            "url": f"https://www.flipkart.com/search?q={q}",
-            "link_type": "search"
-        },
-
-        "meesho": {
-            "name": "Meesho",
-            "url": f"https://www.meesho.com/search?q={q}",
-            "link_type": "search"
-        },
-
-        "google_shopping": {
-            "name": "Google Shopping",
-            "url": (
-                "https://www.google.com/search"
-                f"?tbm=shop&q={q}"
-            ),
-            "link_type": "search"
-        },
-
-        "myntra": {
-            "name": "Myntra",
-            "url": (
-                "https://www.myntra.com/"
-                f"search?query={q}"
-            ),
-            "link_type": "search"
-        },
-
-        "ajio": {
-            "name": "AJIO",
-            "url": (
-                "https://www.ajio.com/search/"
-                f"?text={q}"
-            ),
-            "link_type": "search"
-        },
-
-        "tata_cliq": {
-            "name": "Tata CLiQ",
-            "url": (
-                "https://www.tatacliq.com/search/"
-                f"?searchCategory=all&text={q}"
-            ),
-            "link_type": "search"
-        }
+    allowed_domains = {
+        "Amazon": ["amazon.in"],
+        "Flipkart": ["flipkart.com"],
+        "Meesho": ["meesho.com"],
+        "Google Shopping": ["google.com"],
+        "Myntra": ["myntra.com"],
+        "AJIO": ["ajio.com"],
+        "Tata CLiQ": ["tatacliq.com"]
     }
 
+    from urllib.parse import urlparse
 
-# ==========================================
-# MARKETPLACE STATUS
-# ==========================================
+    try:
+        parsed = urlparse(url)
+
+        if parsed.scheme != "https":
+            return False
+
+        host = (parsed.hostname or "").lower()
+
+        return any(
+            host == domain or host.endswith("." + domain)
+            for domain in allowed_domains.get(name, [])
+        )
+
+    except Exception:
+        return False
+
+
+def create_marketplace_links(
+    product: Product,
+    verified_direct_urls: Optional[Dict[str, str]] = None
+) -> List[Dict[str, Any]]:
+
+    verified_direct_urls = verified_direct_urls or {}
+
+    query = quote_plus(make_product_query(product))
+
+    links = []
+
+    for marketplace in MARKETPLACE_CONFIG:
+
+        name = marketplace["name"]
+
+        direct_url = verified_direct_urls.get(name, "")
+
+        if (
+            direct_url
+            and validate_direct_url(name, direct_url)
+        ):
+            links.append({
+                "name": name,
+                "url": direct_url,
+                "link_type": "direct",
+                "exact_match": True
+            })
+
+        else:
+
+            search_url = marketplace["search"].format(
+                query=query
+            )
+
+            links.append({
+                "name": name,
+                "url": search_url,
+                "link_type": "search",
+                "exact_match": False
+            })
+
+    return links
+
+
+def create_amazon_direct_url(asin: str) -> Optional[str]:
+
+    asin = str(asin).strip().upper()
+
+    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+        return None
+
+    return "https://www.amazon.in/dp/" + asin
+
 
 def get_marketplace_status():
 
-    result = {}
+    result = []
 
-    for key, name in MARKETPLACES.items():
+    for item in MARKETPLACE_CONFIG:
 
-        result[key] = {
-            "name": name,
+        result.append({
+            "name": item["name"],
             "status": "search_link_available",
+            "direct_link_status": "verified_data_required",
             "price_status": "not_connected"
-        }
+        })
 
     return result
+def find_exact_offers(product: Product) -> List[Dict[str, Any]]:
 
-
-# ==========================================
-# PRICE COMPARISON
-# ==========================================
-
-def find_exact_offers(product):
-
-    """
-    Marketplace price APIs are not connected yet.
-
-    This function must return only genuine,
-    verified marketplace offers.
-
-    No fake prices are generated.
-    """
+    # No marketplace price feeds are connected yet.
+    # Never invent product prices or direct product URLs.
 
     return []
 
 
-# ==========================================
-# CHEAPEST OFFER
-# ==========================================
+def find_cheapest_offer(
+    offers: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
 
-def find_cheapest_offer(offers):
-
-    valid_offers = []
-
-    for offer in offers:
-
-        if offer.get("exact_match") is not True:
-            continue
-
-        price = offer.get("price")
-
-        try:
-            price = float(price)
-        except (TypeError, ValueError):
-            continue
-
-        if price <= 0:
-            continue
-
-        valid_offers.append(offer)
+    valid_offers = [
+        offer for offer in offers
+        if isinstance(offer.get("price"), (int, float))
+        and offer["price"] > 0
+        and offer.get("exact_match") is True
+    ]
 
     if not valid_offers:
         return None
 
     return min(
         valid_offers,
-        key=lambda offer: float(offer["price"])
+        key=lambda item: item["price"]
     )
 
 
-# ==========================================
-# RESPONSE BUILDER
-# ==========================================
+def build_product_response(
+    product: Product,
+    verified_direct_urls: Optional[Dict[str, str]] = None
+):
 
-def build_product_response(product):
+    exact_match = is_exact_product(product)
 
-    offers = find_exact_offers(product)
-
-    cheapest = find_cheapest_offer(
-        offers
+    marketplace_links = (
+        create_marketplace_links(
+            product,
+            verified_direct_urls
+        )
+        if exact_match
+        else []
     )
 
-    marketplace_links = create_marketplace_links(
-        product
+    offers = (
+        find_exact_offers(product)
+        if exact_match
+        else []
     )
+
+    cheapest_offer = find_cheapest_offer(offers)
 
     return {
         "success": True,
-        "exact_match": True,
+        "exact_match": exact_match,
         "message": (
-            "Product identified. Marketplace search links are ready."
-            if not offers
-            else "Verified product offers found."
+            "Product identified. Marketplace links are ready."
+            if exact_match
+            else "Product could not be identified with enough confidence."
         ),
-        "product": product,
+        "product": product.model_dump(),
         "offers": offers,
-        "cheapest_offer": cheapest,
+        "cheapest_offer": cheapest_offer,
         "marketplace_links": marketplace_links,
         "marketplaces": get_marketplace_status()
     }
-    
-# ==========================================
-# HOME API
-# ==========================================
+
 
 @app.get("/")
 def home():
 
     return {
-        "app": "PriceDekho AI",
-        "status": "running",
-        "version": "3.0.0",
-        "message": "PriceDekho AI backend is working."
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "status": "running"
     }
 
-
-# ==========================================
-# HEALTH API
-# ==========================================
 
 @app.get("/api/v1/health")
 def health():
 
     return {
         "status": "ok",
-        "ai_configured": bool(API_KEY),
-        "service": "PriceDekho AI Backend",
-        "version": "3.0.0"
+        "app": APP_NAME,
+        "version": APP_VERSION
     }
 
-
-# ==========================================
-# MARKETPLACE STATUS API
-# ==========================================
 
 @app.get("/api/v1/marketplaces")
 def marketplaces():
 
     return {
         "success": True,
-        "marketplaces": get_marketplace_status(),
-        "total_platforms": len(MARKETPLACES),
-        "price_comparison": "not_connected",
-        "message": (
-            "Marketplace search links are available. "
-            "Live price APIs are not connected."
-        )
+        "marketplaces": get_marketplace_status()
     }
 
-
-# ==========================================
-# PRODUCT LINK API
-# ==========================================
 
 @app.get("/api/v1/product-links")
 def product_links(
     brand: str,
     model: str,
-    variant: str = "unknown"
+    variant: str = ""
 ):
 
-    product = {
-        "brand": clean_text(brand),
-        "model": clean_text(model),
-        "variant": clean_text(variant)
-    }
-
-    if (
-        normalize_text(product["brand"]) == "unknown"
-        or normalize_text(product["model"]) == "unknown"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Valid brand and model are required."
-        )
-
-    links = create_marketplace_links(
-        product
+    product = Product(
+        brand=brand,
+        model=model,
+        variant=variant,
+        confidence=1.0
     )
 
     return {
         "success": True,
-        "product": product,
-        "marketplace_links": links
-}
-# ==========================================
-# IMAGE PRODUCT SEARCH API
-# ==========================================
+        "product": product.model_dump(),
+        "marketplace_links": create_marketplace_links(product),
+        "marketplaces": get_marketplace_status()
+    }
+
 
 @app.post("/api/v1/search/image")
-async def search_image(
-    file: UploadFile = File(...)
-):
+async def search_image(file: UploadFile = File(...)):
 
-    # Check image MIME type.
-
-    if file.content_type not in ALLOWED_TYPES:
-
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(
-            status_code=415,
-            detail="Upload JPG, PNG or WEBP only."
+            status_code=400,
+            detail="Please upload a valid image."
         )
 
-    # Read image with size limit.
-
-    image_bytes = await file.read(
-        MAX_SIZE + 1
-    )
+    image_bytes = await file.read()
 
     if not image_bytes:
-
         raise HTTPException(
             status_code=400,
-            detail="Image is empty."
+            detail="Uploaded image is empty."
         )
 
-    if len(image_bytes) > MAX_SIZE:
-
+    if len(image_bytes) > MAX_IMAGE_SIZE:
         raise HTTPException(
             status_code=413,
-            detail="Image must be under 8 MB."
+            detail="Image size must be less than 10 MB."
         )
-
-    # Verify actual image.
 
     try:
-
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        )
-
+        image = Image.open(io.BytesIO(image_bytes))
         image.verify()
 
-    except (
-        UnidentifiedImageError,
-        OSError,
-        ValueError
-    ):
-
+    except Exception:
         raise HTTPException(
             status_code=400,
-            detail="Invalid image file."
+            detail="Image file is invalid or corrupted."
         )
-
-    # Identify product using Gemini.
 
     product = identify_product(
         image_bytes,
         file.content_type
     )
 
-    # Verify exact product.
+    return build_product_response(product)
+class DirectLinkRequest(BaseModel):
+    brand: str
+    model: str
+    variant: str = ""
+    marketplace: str
+    product_url: str
 
-    exact_match = is_exact_product(
-        product
+
+@app.post("/api/v1/direct-link/verify")
+def register_direct_link(data: DirectLinkRequest):
+
+    product = Product(
+        brand=data.brand,
+        model=data.model,
+        variant=data.variant,
+        confidence=1.0
     )
 
-    # Stop if product identification is uncertain.
+    allowed_names = [
+        item["name"]
+        for item in MARKETPLACE_CONFIG
+    ]
 
-    if not exact_match:
+    if data.marketplace not in allowed_names:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported marketplace."
+        )
 
-        return {
-            "success": True,
-            "exact_match": False,
-            "message": (
-                "Exact model could not be confirmed. "
-                "Please upload a clearer product photo."
-            ),
-            "product": product,
-            "offers": [],
-            "cheapest_offer": None,
-            "marketplace_links": {},
-            "marketplaces": get_marketplace_status()
+    if not validate_direct_url(
+        data.marketplace,
+        data.product_url
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid marketplace product URL."
+        )
+
+    # This endpoint validates the URL domain and format.
+    # It does NOT independently verify product identity.
+    # Only use it after a trusted source confirms the exact match.
+
+    links = create_marketplace_links(
+        product,
+        {
+            data.marketplace: data.product_url
         }
-
-    # Generate complete response.
-
-    return build_product_response(
-        product
     )
+
+    return {
+        "success": True,
+        "message": "URL format accepted. Product identity still requires verification.",
+        "marketplace_links": links
+    }
     
